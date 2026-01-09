@@ -1,0 +1,5 @@
+{
+  "name": "Quantum Drum: Resonant Modes",
+  "description": "Interactive simulation of a circular membrane's resonant modes (standing waves) demonstrating the analogy to 2D electron orbital quantization.",
+  "requestFramePermissions": []
+}
