@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
+<head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Quantum Drum Simulation</title>
@@ -9,6 +9,8 @@
       body {
         background-color: #0f172a; /* slate-900 */
         color: #e2e8f0; /* slate-200 */
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       }
       /* Custom scrollbar for webkit */
       ::-webkit-scrollbar {
@@ -25,7 +27,8 @@
         background: #64748b;
       }
     </style>
-  <script type="importmap">
+    <!-- Import Map for ES Modules over CDN -->
+    <script type="importmap">
 {
   "imports": {
     "react": "https://esm.sh/react@18.2.0",
@@ -38,8 +41,940 @@
 }
 </script>
 </head>
-  <body>
+<body>
     <div id="root"></div>
-    <script type="module" src="/index.js"></script>
-  </body>
+
+    <script type="module">
+        import React, { useState, useRef, useEffect } from 'react';
+        import ReactDOM from 'react-dom/client';
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // ==========================================
+        // CONSTANTS & UTILS
+        // ==========================================
+
+        const BESSEL_ROOTS = [
+            [2.4048, 5.5201, 8.6537, 11.7915, 14.9309, 18.0711], // n=0
+            [3.8317, 7.0156, 10.1735, 13.3237, 16.4706, 19.6159], // n=1
+            [5.1356, 8.4172, 11.6198, 14.7960, 17.9598, 21.1170], // n=2
+            [6.3802, 9.7610, 13.0152, 16.2235, 19.4094, 22.5827], // n=3
+            [7.5883, 11.0647, 14.3725, 17.6160, 20.8269, 24.0190], // n=4
+            [8.7715, 12.3386, 15.7002, 18.9801, 22.2178, 25.4303], // n=5
+        ];
+
+        function besselJ(n, x) {
+            if (x === 0) return n === 0 ? 1 : 0;
+            let sum = 0;
+            let term = 1;
+            const halfX = x / 2;
+            const limit = 20; 
+            let factorialN = 1;
+            for (let i = 1; i <= n; i++) factorialN *= i;
+            term = Math.pow(halfX, n) / factorialN;
+            sum = term;
+            for (let k = 1; k < limit; k++) {
+                term *= -1 * (halfX * halfX) / (k * (n + k));
+                sum += term;
+                if (Math.abs(term) < 1e-10) break;
+            }
+            return sum;
+        }
+
+        function getBesselRoot(n, m) {
+            if (n < 0 || n >= BESSEL_ROOTS.length) return 0;
+            if (m < 1 || m > BESSEL_ROOTS[0].length) return 0;
+            return BESSEL_ROOTS[n][m - 1];
+        }
+
+        function factorial(n) {
+            if (n <= 1) return 1;
+            let result = 1;
+            for (let i = 2; i <= n; i++) result *= i;
+            return result;
+        }
+
+        function laguerre(n, alpha, x) {
+            let L0 = 1;
+            if (n === 0) return L0;
+            let L1 = 1 + alpha - x;
+            if (n === 1) return L1;
+            for (let i = 2; i <= n; i++) {
+                const nextL = ((2 * i - 1 + alpha - x) * L1 - (i - 1 + alpha) * L0) / i;
+                L0 = L1;
+                L1 = nextL;
+            }
+            return L1;
+        }
+
+        function legendre(l, x) {
+            if (l === 0) return 1;
+            if (l === 1) return x;
+            let P0 = 1;
+            let P1 = x;
+            for (let i = 2; i <= l; i++) {
+                const nextP = ((2 * i - 1) * x * P1 - (i - 1) * P0) / i;
+                P0 = P1;
+                P1 = nextP;
+            }
+            return P1;
+        }
+
+        function getHydrogenPsi(N, L, r, cosTheta) {
+            if (N <= L) return 0;
+            const rho = (2 * r) / N;
+            const radial = Math.exp(-rho / 2) * Math.pow(rho, L) * laguerre(N - L - 1, 2 * L + 1, rho);
+            const angular = legendre(L, cosTheta);
+            return radial * angular;
+        }
+
+        function getRadialNodeRadii(N, L) {
+            const n_poly = N - L - 1;
+            if (n_poly < 1) return [];
+            const alpha = 2 * L + 1;
+            const roots = [];
+            const step = 0.05;
+            const maxRho = 4 * N + 10; 
+            let prevVal = laguerre(n_poly, alpha, 0);
+            for (let rho = step; rho < maxRho; rho += step) {
+                const val = laguerre(n_poly, alpha, rho);
+                if (prevVal * val <= 0) {
+                    const frac = Math.abs(prevVal) / (Math.abs(prevVal) + Math.abs(val));
+                    const rootRho = rho - step + frac * step;
+                    roots.push(rootRho * N / 2);
+                }
+                prevVal = val;
+            }
+            return roots;
+        }
+
+        function getAngularNodeAngles(L) {
+            if (L < 1) return [];
+            const roots = [];
+            const step = 0.01;
+            let prevVal = legendre(L, -1);
+            for (let x = -1 + step; x <= 1; x += step) {
+                const val = legendre(L, x);
+                if (prevVal * val <= 0) {
+                    const frac = Math.abs(prevVal) / (Math.abs(prevVal) + Math.abs(val));
+                    const rootX = (x - step) + frac * step;
+                    roots.push(Math.acos(rootX));
+                }
+                prevVal = val;
+            }
+            return roots;
+        }
+
+        // ==========================================
+        // COMPONENTS
+        // ==========================================
+
+        // --- DrumCanvas Component ---
+        const DrumCanvas = ({ l, n, isPlaying, speed, amplitude, resolution, viewMode, zoom, slicePosition, radialClip, particleBrightness, probPower }) => {
+            const containerRef = useRef(null);
+            const rendererRef = useRef(null);
+            const sceneRef = useRef(null);
+            const cameraRef = useRef(null);
+            const objectRef = useRef(null);
+            const controlsRef = useRef(null);
+            const timeRef = useRef(0);
+            const animationFrameRef = useRef(0);
+            
+            const propsRef = useRef({ l, n, isPlaying, speed, amplitude, resolution, viewMode, zoom, slicePosition, radialClip, particleBrightness, probPower });
+            useEffect(() => {
+                propsRef.current = { l, n, isPlaying, speed, amplitude, resolution, viewMode, zoom, slicePosition, radialClip, particleBrightness, probPower };
+            }, [l, n, isPlaying, speed, amplitude, resolution, viewMode, zoom, slicePosition, radialClip, particleBrightness, probPower]);
+
+            useEffect(() => {
+                const container = containerRef.current;
+                if (!container) return;
+                container.innerHTML = '';
+                const width = container.clientWidth;
+                const height = container.clientHeight;
+
+                const scene = new THREE.Scene();
+                scene.background = new THREE.Color(0x0f172a);
+                scene.fog = new THREE.FogExp2(0x0f172a, 0.08); 
+                sceneRef.current = scene;
+
+                const camera = new THREE.PerspectiveCamera(40, width / height, 0.1, 100);
+                camera.position.set(4, 3.5, 4);
+                camera.lookAt(0, 0, 0);
+                cameraRef.current = camera;
+
+                const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+                renderer.setSize(width, height);
+                renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                renderer.shadowMap.enabled = true;
+                container.appendChild(renderer.domElement);
+                rendererRef.current = renderer;
+
+                const controls = new OrbitControls(camera, renderer.domElement);
+                controls.enableDamping = true;
+                controls.dampingFactor = 0.05;
+                controlsRef.current = controls;
+
+                const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+                scene.add(ambientLight);
+                const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+                dirLight.position.set(5, 8, 5);
+                dirLight.castShadow = true;
+                scene.add(dirLight);
+
+                const animate = () => {
+                    animationFrameRef.current = requestAnimationFrame(animate);
+                    const { isPlaying, speed, viewMode: currentMode } = propsRef.current;
+
+                    if (controlsRef.current) controlsRef.current.update();
+
+                    if (isPlaying) {
+                        const dt = currentMode === 'DRUM' ? 0.01 : 0.005; 
+                        timeRef.current += dt * speed;
+                    }
+
+                    const t = timeRef.current;
+
+                    if (currentMode === 'DRUM' && objectRef.current) {
+                        animateDrum(t);
+                    } else if (currentMode === 'STRING' && objectRef.current) {
+                        animateString(t);
+                    } else if (currentMode === 'ORBITAL' && objectRef.current) {
+                        // Manual rotation via controls mostly
+                    }
+
+                    if (rendererRef.current && sceneRef.current && cameraRef.current) {
+                        rendererRef.current.render(sceneRef.current, cameraRef.current);
+                    }
+                };
+                animate();
+
+                return () => {
+                    cancelAnimationFrame(animationFrameRef.current);
+                    if (rendererRef.current) rendererRef.current.dispose();
+                };
+            }, []);
+
+            // Camera Control
+            useEffect(() => {
+                if (!cameraRef.current || !controlsRef.current) return;
+                let targetPos = new THREE.Vector3();
+                let targetLookAt = new THREE.Vector3(0,0,0);
+                if (viewMode === 'DRUM') {
+                    targetPos.set(3.5, 3.5, 3.5);
+                } else if (viewMode === 'STRING') {
+                    targetPos.set(0, 1.5, 5.5);
+                } else {
+                    targetPos.set(0, 0, 16);
+                }
+                const distanceScale = 1.0 / zoom;
+                targetPos.multiplyScalar(distanceScale);
+                cameraRef.current.position.copy(targetPos);
+                cameraRef.current.lookAt(targetLookAt);
+                controlsRef.current.target.copy(targetLookAt);
+                controlsRef.current.update();
+            }, [viewMode]); 
+
+            // Zoom
+            useEffect(() => {
+                if (!cameraRef.current || !controlsRef.current) return;
+                const controls = controlsRef.current;
+                const direction = new THREE.Vector3().subVectors(cameraRef.current.position, controls.target).normalize();
+                let baseDist = 16;
+                if (viewMode === 'DRUM') baseDist = 6;
+                if (viewMode === 'STRING') baseDist = 6;
+                const newDist = baseDist / zoom;
+                cameraRef.current.position.copy(controls.target).add(direction.multiplyScalar(newDist));
+                controls.update();
+            }, [zoom]);
+
+            // Shader Updates
+            useEffect(() => {
+                if (!objectRef.current || viewMode !== 'ORBITAL') return;
+                let points = null;
+                objectRef.current.traverse((child) => {
+                    if (child instanceof THREE.Points) points = child;
+                });
+                if (points && points.material) {
+                    const mat = points.material;
+                    const shader = mat.userData.shader;
+                    if (shader) {
+                        const visualBound = 7.0;
+                        const zCut = visualBound - (slicePosition * 2.0 * visualBound);
+                        const rCut = radialClip * 8.0; 
+                        shader.uniforms.uSlice.value = zCut;
+                        shader.uniforms.uRadial.value = rCut;
+                        shader.uniforms.uBrightness.value = particleBrightness;
+                        shader.uniforms.uContrast.value = probPower;
+                    }
+                }
+            }, [slicePosition, radialClip, particleBrightness, probPower, viewMode]);
+
+            // Object Gen
+            useEffect(() => {
+                if (!sceneRef.current) return;
+                if (objectRef.current) {
+                    sceneRef.current.remove(objectRef.current);
+                    objectRef.current.traverse((child) => {
+                        if (child instanceof THREE.Mesh || child instanceof THREE.Line || child instanceof THREE.Points) {
+                            if (child.geometry) child.geometry.dispose();
+                            if (child.material) {
+                                if (Array.isArray(child.material)) {
+                                    child.material.forEach((m) => m.dispose());
+                                } else {
+                                    child.material.dispose();
+                                }
+                            }
+                        }
+                    });
+                    objectRef.current = null;
+                }
+
+                if (viewMode === 'DRUM') createDrum();
+                else if (viewMode === 'STRING') createString();
+                else createOrbital();
+
+            }, [viewMode, l, n, resolution, amplitude]); 
+
+            const animateString = (t) => {
+                if (!objectRef.current) return;
+                const mesh = objectRef.current.getObjectByName("stringLine");
+                if (!mesh || !mesh.geometry) return;
+                const positions = mesh.geometry.attributes.position;
+                const colors = mesh.geometry.attributes.color;
+                const count = positions.count;
+                const { n, amplitude } = propsRef.current;
+                for (let i = 0; i < count; i++) {
+                    const xWorld = positions.getX(i); 
+                    const xNorm = (xWorld + 2.5) / 5.0; 
+                    const y = amplitude * Math.sin(n * Math.PI * xNorm) * Math.cos(t * 2);
+                    positions.setY(i, y);
+                    if (y > 0) {
+                        const intensity = Math.min(1, Math.abs(y) / (amplitude * 0.5));
+                        colors.setXYZ(i, 0.22 + (1-0.22)*(1-intensity), 0.74 + (1-0.74)*(1-intensity), 0.97); 
+                    } else {
+                        const intensity = Math.min(1, Math.abs(y) / (amplitude * 0.5));
+                        colors.setXYZ(i, 0.98 + (1-0.98)*(1-intensity), 0.44 + (1-0.44)*(1-intensity), 0.52 + (1-0.52)*(1-intensity));
+                    }
+                }
+                positions.needsUpdate = true;
+                colors.needsUpdate = true;
+            }
+
+            const animateDrum = (t) => {
+                if (!objectRef.current) return;
+                const mesh = objectRef.current.getObjectByName("drumSkin");
+                if (!mesh || !mesh.geometry) return;
+                const geometry = mesh.geometry;
+                if (!geometry.attributes || !geometry.attributes.position) return;
+                const { l, n, amplitude } = propsRef.current;
+                const positionAttribute = geometry.attributes.position;
+                const colorAttribute = geometry.attributes.color;
+                const count = positionAttribute.count;
+                const root = getBesselRoot(l, n);
+                const cosT = Math.cos(t * root);
+                for (let i = 0; i < count; i++) {
+                    const x = positionAttribute.getX(i);
+                    const z = positionAttribute.getZ(i);
+                    const r = Math.sqrt(x*x + z*z);
+                    const theta = Math.atan2(z, x);
+                    let height = 0;
+                    if (r < 1.15) { 
+                        const val = besselJ(l, root * (r / 1.2));
+                        const angular = Math.cos(l * theta);
+                        height = 0.5 * amplitude * val * angular * cosT; 
+                    } 
+                    positionAttribute.setY(i, height);
+                    const intensity = height * (2.0 / Math.max(0.5, amplitude * 0.5)); 
+                    if (r > 1.18) {
+                        if (colorAttribute) colorAttribute.setXYZ(i, 0.06, 0.09, 0.16); 
+                    } else {
+                        if (colorAttribute) {
+                            if (intensity > 0) {
+                                const tCol = Math.min(1, intensity);
+                                colorAttribute.setXYZ(i, 0.06 + (0.22 - 0.06) * tCol, 0.09 + (0.74 - 0.09) * tCol, 0.16 + (0.97 - 0.16) * tCol);
+                            } else {
+                                const tCol = Math.min(1, Math.abs(intensity));
+                                colorAttribute.setXYZ(i, 0.06 + (0.98 - 0.06) * tCol, 0.09 + (0.44 - 0.09) * tCol, 0.16 + (0.52 - 0.16) * tCol);
+                            }
+                        }
+                    }
+                }
+                positionAttribute.needsUpdate = true;
+                if (colorAttribute) colorAttribute.needsUpdate = true;
+                geometry.computeVertexNormals();
+            };
+            
+            const createString = () => {
+                if (!sceneRef.current) return;
+                const group = new THREE.Group();
+                const segmentCount = 200;
+                const geometry = new THREE.BufferGeometry();
+                const positions = new Float32Array(segmentCount * 3);
+                const colors = new Float32Array(segmentCount * 3);
+                const width = 5.0;
+                for (let i = 0; i < segmentCount; i++) {
+                    const t = i / (segmentCount - 1);
+                    const x = (t - 0.5) * width;
+                    positions[i * 3] = x;
+                    positions[i * 3 + 1] = 0;
+                    positions[i * 3 + 2] = 0;
+                    colors[i*3] = 1; colors[i*3+1] = 1; colors[i*3+2] = 1;
+                }
+                geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                const material = new THREE.LineBasicMaterial({ vertexColors: true, linewidth: 3 });
+                const line = new THREE.Line(geometry, material);
+                line.name = "stringLine";
+                group.add(line);
+                const anchorGeo = new THREE.SphereGeometry(0.1, 16, 16);
+                const anchorMat = new THREE.MeshStandardMaterial({ color: 0x475569 });
+                const leftAnchor = new THREE.Mesh(anchorGeo, anchorMat);
+                leftAnchor.position.set(-width/2, 0, 0);
+                const rightAnchor = new THREE.Mesh(anchorGeo, anchorMat);
+                rightAnchor.position.set(width/2, 0, 0);
+                group.add(leftAnchor);
+                group.add(rightAnchor);
+                const axisGeo = new THREE.BufferGeometry().setFromPoints([
+                    new THREE.Vector3(-width/2, 0, 0),
+                    new THREE.Vector3(width/2, 0, 0)
+                ]);
+                const axisMat = new THREE.LineBasicMaterial({ color: 0xffffff, opacity: 0.1, transparent: true });
+                const axis = new THREE.Line(axisGeo, axisMat);
+                group.add(axis);
+                objectRef.current = group;
+                sceneRef.current.add(group);
+            };
+
+            const createDrum = () => {
+                if (!sceneRef.current) return;
+                const group = new THREE.Group();
+                const rimGeo = new THREE.TorusGeometry(1.2, 0.05, 16, 100);
+                rimGeo.rotateX(-Math.PI / 2);
+                const rimMat = new THREE.MeshStandardMaterial({ color: 0x475569, roughness: 0.2, metalness: 0.8 });
+                const rim = new THREE.Mesh(rimGeo, rimMat);
+                rim.name = "rim";
+                group.add(rim);
+                const geometry = new THREE.PlaneGeometry(2.4, 2.4, resolution, resolution);
+                geometry.rotateX(-Math.PI / 2);
+                if (geometry.attributes && geometry.attributes.position) {
+                    const count = geometry.attributes.position.count;
+                    const colors = new Float32Array(count * 3);
+                    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                    for(let i=0; i<count; i++) {
+                        colors[i*3] = 0.06; colors[i*3+1] = 0.09; colors[i*3+2] = 0.16;
+                    }
+                }
+                const material = new THREE.MeshPhongMaterial({
+                    side: THREE.DoubleSide,
+                    vertexColors: true,
+                    shininess: 80,
+                    specular: 0x222222,
+                });
+                const mesh = new THREE.Mesh(geometry, material);
+                mesh.name = "drumSkin"; 
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                group.add(mesh);
+                objectRef.current = group;
+                sceneRef.current.add(group);
+            };
+
+            const createOrbital = () => {
+                if (!sceneRef.current) return;
+                const N = n + l;
+                const L = l;
+                const group = new THREE.Group();
+                const bound = 3.0 * N * N + 5; 
+                const scaleFactor = 6.0 / bound; 
+
+                const particleCount = 150000 * amplitude;
+                const positions = [];
+                const colors = [];
+                const intensities = []; 
+                
+                let count = 0;
+                const maxAttempts = particleCount * 200; 
+                let attempts = 0;
+                const probMultiplier = 150 * Math.pow(N, 2.5);
+
+                let maxProbFound = 0.00001;
+                const rawProbs = [];
+
+                while (count < particleCount && attempts < maxAttempts) {
+                    attempts++;
+                    const x = (Math.random() - 0.5) * 2 * bound;
+                    const y = (Math.random() - 0.5) * 2 * bound;
+                    const z = (Math.random() - 0.5) * 2 * bound;
+                    const r = Math.sqrt(x*x + y*y + z*z);
+                    if (r === 0) continue;
+                    const cosTheta = y / r; 
+                    
+                    const psi = getHydrogenPsi(N, L, r, cosTheta);
+                    const prob = psi * psi; 
+                    const threshold = Math.random();
+                    
+                    if (prob * probMultiplier > threshold) {
+                        positions.push(x * scaleFactor, y * scaleFactor, z * scaleFactor);
+                        rawProbs.push(prob);
+                        if (prob > maxProbFound) maxProbFound = prob;
+                        if (psi > 0) {
+                            colors.push(0.22, 0.74, 0.97); 
+                        } else {
+                            colors.push(0.98, 0.44, 0.52); 
+                        }
+                        count++;
+                    }
+                }
+
+                for (let i = 0; i < rawProbs.length; i++) {
+                    intensities.push(rawProbs[i] / maxProbFound);
+                }
+
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+                geometry.setAttribute('intensity', new THREE.Float32BufferAttribute(intensities, 1));
+
+                const initialVisualBound = 7.0;
+                const initialZCut = initialVisualBound - (propsRef.current.slicePosition * 2.0 * initialVisualBound);
+                const initialRCut = propsRef.current.radialClip * 8.0;
+                const initialBrightness = propsRef.current.particleBrightness;
+                const initialContrast = propsRef.current.probPower;
+
+                const material = new THREE.PointsMaterial({
+                    size: 0.08,
+                    vertexColors: true,
+                    transparent: true,
+                    opacity: 0.8,
+                    blending: THREE.AdditiveBlending,
+                    depthWrite: false,
+                });
+                
+                material.onBeforeCompile = (shader) => {
+                    shader.uniforms.uSlice = { value: initialZCut };
+                    shader.uniforms.uRadial = { value: initialRCut };
+                    shader.uniforms.uBrightness = { value: initialBrightness };
+                    shader.uniforms.uContrast = { value: initialContrast };
+                    
+                    shader.vertexShader = `
+                    attribute float intensity;
+                    varying vec3 vWorldPos;
+                    varying vec3 vLocalPos;
+                    varying float vIntensity;
+                    ${shader.vertexShader}
+                    `.replace(
+                    `#include <begin_vertex>`,
+                    `#include <begin_vertex>
+                    vLocalPos = position;
+                    vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
+                    vIntensity = intensity;
+                    `
+                    );
+                    
+                    shader.fragmentShader = `
+                    uniform float uSlice;
+                    uniform float uRadial;
+                    uniform float uBrightness;
+                    uniform float uContrast;
+                    varying vec3 vWorldPos;
+                    varying vec3 vLocalPos;
+                    varying float vIntensity;
+                    ${shader.fragmentShader}
+                    `.replace(
+                    `#include <color_fragment>`,
+                    `#include <color_fragment>
+                    if (vWorldPos.z > uSlice) discard;
+                    if (length(vLocalPos) > uRadial) discard;
+                    float visibility = pow(vIntensity, uContrast - 1.0);
+                    diffuseColor.a *= visibility;
+                    diffuseColor.rgb *= uBrightness;
+                    `
+                    );
+                    material.userData.shader = shader;
+                };
+
+                const points = new THREE.Points(geometry, material);
+                group.add(points);
+                
+                const nodeMat = new THREE.LineBasicMaterial({ 
+                    color: 0xffffff, 
+                    transparent: true, 
+                    opacity: 0.15,
+                    depthWrite: false 
+                });
+
+                const radialRoots = getRadialNodeRadii(N, L);
+                radialRoots.forEach(r => {
+                    const visualRadius = r * scaleFactor;
+                    const geo = new THREE.SphereGeometry(visualRadius, 32, 32);
+                    const wireframe = new THREE.WireframeGeometry(geo);
+                    const line = new THREE.LineSegments(wireframe, nodeMat);
+                    group.add(line);
+                });
+
+                const angularRoots = getAngularNodeAngles(L);
+                angularRoots.forEach(theta => {
+                    const size = 6;
+                    if (Math.abs(theta - Math.PI/2) < 0.01) {
+                        const geo = new THREE.CircleGeometry(size, 64);
+                        geo.rotateX(Math.PI/2);
+                        const wireframe = new THREE.WireframeGeometry(geo);
+                        const line = new THREE.LineSegments(wireframe, nodeMat);
+                        group.add(line);
+                    } else {
+                        const h = size * Math.cos(theta);
+                        const r = size * Math.sin(theta);
+                        const coneH = 6;
+                        const coneR = Math.abs(coneH * Math.tan(theta));
+                        const geo = new THREE.ConeGeometry(coneR, coneH, 32, 1, true);
+                        geo.translate(0, -coneH/2, 0); 
+                        if (theta > Math.PI/2) geo.rotateX(Math.PI); 
+                        const wireframe = new THREE.WireframeGeometry(geo);
+                        const line = new THREE.LineSegments(wireframe, nodeMat);
+                        group.add(line);
+                    }
+                });
+
+                const coreGeo = new THREE.SphereGeometry(0.15, 8, 8);
+                const coreMat = new THREE.MeshBasicMaterial({ color: 0xffffff, opacity: 0.8, transparent: true });
+                const core = new THREE.Mesh(coreGeo, coreMat);
+                group.add(core);
+
+                objectRef.current = group;
+                sceneRef.current.add(group);
+            };
+
+            return React.createElement('div', {
+                ref: containerRef,
+                className: "w-full h-full rounded-2xl overflow-hidden shadow-2xl border border-slate-700 bg-slate-900 relative"
+            }, React.createElement('div', {
+                className: "absolute inset-0 pointer-events-none bg-gradient-to-t from-slate-900/50 to-transparent"
+            }));
+        };
+
+        // --- InfoPanel Component ---
+        const InfoPanel = ({ l, n }) => {
+            return React.createElement('div', { className: "bg-slate-800/50 backdrop-blur-md p-6 rounded-2xl border border-slate-700/50 text-slate-300" },
+                React.createElement('h3', { className: "text-lg font-bold text-white mb-4 border-b border-slate-700 pb-2" }, "Physics & Quantum Analogy"),
+                React.createElement('div', { className: "space-y-4 text-sm leading-relaxed" },
+                React.createElement('section', null,
+                    React.createElement('h4', { className: "font-semibold text-rose-300 mb-1" }, "1D: Vibrating String"),
+                    React.createElement('p', null, "The fundamental example of standing waves. A string of length L fixed at both ends."),
+                    React.createElement('ul', { className: "list-disc list-inside mt-2 text-slate-400" },
+                    React.createElement('li', null, React.createElement('span', { className: "text-rose-400 font-mono" }, "n"), ": Harmonic number (integer)."),
+                    React.createElement('li', null, "Wave: ", React.createElement('span', { className: "font-mono text-xs" }, "sin(nπx/L)cos(ωt)")),
+                    React.createElement('li', null, "Nodes are points that never move.")
+                    )
+                ),
+                React.createElement('section', null,
+                    React.createElement('h4', { className: "font-semibold text-sky-300 mb-1" }, "2D: The Drum Skin"),
+                    React.createElement('p', null, "Circular membrane fixed at the rim. Governed by the 2D Wave Equation."),
+                    React.createElement('ul', { className: "list-disc list-inside mt-2 text-slate-400" },
+                    React.createElement('li', null, React.createElement('span', { className: "text-sky-400 font-mono" }, `l = ${l}`), ": Angular Quantum Number (nodal diameters)."),
+                    React.createElement('li', null, React.createElement('span', { className: "text-rose-400 font-mono" }, `n = ${n}`), ": Radial Quantum Number (nodal circles).")
+                    )
+                ),
+                React.createElement('section', null,
+                    React.createElement('h4', { className: "font-semibold text-purple-300 mb-1" }, "3D: Hydrogen Orbital"),
+                    React.createElement('p', null, "The ", React.createElement('span', { className: "text-white font-semibold" }, "Schrödinger Equation"), " solution for the Hydrogen atom."),
+                    React.createElement('div', { className: "mt-2 bg-slate-900/50 p-3 rounded-lg border border-slate-700/50 font-mono text-xs" },
+                    React.createElement('div', { className: "grid grid-cols-2 gap-2" },
+                        React.createElement('span', null, "Principal (N):"), React.createElement('span', { className: "text-rose-400" }, n + l),
+                        React.createElement('span', null, "Angular (l):"), React.createElement('span', { className: "text-sky-400" }, l)
+                    )
+                    ),
+                    React.createElement('p', { className: "text-xs text-slate-500 mt-1 italic" }, "Note: In simulation, 'n' controls radial nodes. Actual Principal Number N = n + l.")
+                )
+                )
+            );
+        };
+
+        // --- Controls Component ---
+        const Controls = ({ state, onChange }) => {
+            const isOrbital = state.viewMode === 'ORBITAL';
+            const isString = state.viewMode === 'STRING';
+            
+            let radialLabel = 'Radial Quantum Number';
+            let radialSymbol = 'n';
+            let radialValue = state.n;
+            let radialMin = 1;
+            let radialMax = 5;
+
+            if (isOrbital) {
+                radialLabel = 'Principal Quantum Number';
+                radialSymbol = 'N';
+                radialValue = state.n + state.l;
+                radialMin = state.l + 1;
+                radialMax = state.l + 5;
+            } else if (isString) {
+                radialLabel = 'Harmonic Number';
+                radialSymbol = 'n';
+                radialValue = state.n;
+                radialMin = 1;
+                radialMax = 8;
+            }
+            
+            const handleRadialChange = (val) => {
+                if (isOrbital) {
+                onChange({ n: val - state.l });
+                } else {
+                onChange({ n: val });
+                }
+            };
+
+            return React.createElement('div', { className: "bg-slate-800/80 backdrop-blur-md p-6 rounded-2xl border border-slate-700 shadow-xl w-full max-w-md" },
+                React.createElement('h2', { className: "text-xl font-bold text-white mb-6 flex items-center gap-2" },
+                React.createElement('svg', { xmlns: "http://www.w3.org/2000/svg", className: "h-6 w-6 text-sky-400", fill: "none", viewBox: "0 0 24 24", stroke: "currentColor" },
+                    React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" })
+                ),
+                "Wave Controls"
+                ),
+
+                /* Mode Toggle */
+                React.createElement('div', { className: "mb-8 bg-slate-900/50 p-1 rounded-lg flex border border-slate-700/50" },
+                React.createElement('button', {
+                    onClick: () => onChange({ viewMode: 'STRING' }),
+                    className: `flex-1 py-2 text-xs sm:text-sm font-bold rounded-md transition-all ${state.viewMode === 'STRING' ? 'bg-rose-600 text-white shadow-lg' : 'text-slate-400 hover:text-white'}`
+                }, "1D String"),
+                React.createElement('button', {
+                    onClick: () => onChange({ viewMode: 'DRUM' }),
+                    className: `flex-1 py-2 text-xs sm:text-sm font-bold rounded-md transition-all ${state.viewMode === 'DRUM' ? 'bg-slate-700 text-white shadow-lg' : 'text-slate-400 hover:text-white'}`
+                }, "2D Drum"),
+                React.createElement('button', {
+                    onClick: () => onChange({ viewMode: 'ORBITAL' }),
+                    className: `flex-1 py-2 text-xs sm:text-sm font-bold rounded-md transition-all ${state.viewMode === 'ORBITAL' ? 'bg-gradient-to-r from-sky-600 to-purple-600 text-white shadow-lg' : 'text-slate-400 hover:text-white'}`
+                }, "3D Orbital")
+                ),
+
+                React.createElement('div', { className: "space-y-6" },
+                /* Angular Mode (l) */
+                !isString && React.createElement('div', null,
+                    React.createElement('div', { className: "flex justify-between mb-2" },
+                    React.createElement('label', { className: "text-sm font-medium text-slate-300" }, "Angular Quantum Number (", React.createElement('span', { className: "font-mono text-sky-400" }, "l"), ")"),
+                    React.createElement('span', { className: "text-sky-400 font-mono font-bold" }, state.l)
+                    ),
+                    React.createElement('input', {
+                    type: "range", min: "0", max: "5", step: "1", value: state.l,
+                    onChange: (e) => onChange({ l: parseInt(e.target.value) }),
+                    className: "w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-sky-500 hover:accent-sky-400 transition-all"
+                    }),
+                    React.createElement('p', { className: "text-xs text-slate-500 mt-1" }, "Determines the number of angular nodal planes.")
+                ),
+
+                /* Radial Mode (n) */
+                React.createElement('div', null,
+                    React.createElement('div', { className: "flex justify-between mb-2" },
+                    React.createElement('label', { className: "text-sm font-medium text-slate-300" }, radialLabel, " (", React.createElement('span', { className: "font-mono text-rose-400" }, radialSymbol), ")"),
+                    React.createElement('span', { className: "text-rose-400 font-mono font-bold" }, radialValue)
+                    ),
+                    React.createElement('input', {
+                    type: "range", min: radialMin, max: radialMax, step: "1", value: radialValue,
+                    onChange: (e) => handleRadialChange(parseInt(e.target.value)),
+                    className: "w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-rose-500 hover:accent-rose-400 transition-all"
+                    }),
+                    React.createElement('p', { className: "text-xs text-slate-500 mt-1" },
+                    isOrbital ? "Energy Shell (N must be > l)." : isString ? "Number of antinodes (bumps) on the string." : "Number of radial nodal circles."
+                    )
+                ),
+
+                /* Orbital Specific Tools */
+                state.viewMode === 'ORBITAL' && React.createElement('div', { className: "bg-slate-900/30 p-4 rounded-xl border border-slate-700/50 space-y-4" },
+                    React.createElement('h3', { className: "text-xs font-bold text-slate-400 uppercase tracking-wider" }, "Interrogation Tools"),
+                    React.createElement('div', null,
+                    React.createElement('div', { className: "flex justify-between mb-2" },
+                        React.createElement('label', { className: "text-sm font-medium text-slate-300" }, "Z-Slice Cut"),
+                        React.createElement('span', { className: "text-slate-400 font-mono" }, Math.round(state.slicePosition * 100) + "%")
+                    ),
+                    React.createElement('input', {
+                        type: "range", min: "0", max: "1", step: "0.01", value: state.slicePosition,
+                        onChange: (e) => onChange({ slicePosition: parseFloat(e.target.value) }),
+                        className: "w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500 hover:accent-orange-400 transition-all"
+                    })
+                    ),
+                    React.createElement('div', null,
+                    React.createElement('div', { className: "flex justify-between mb-2" },
+                        React.createElement('label', { className: "text-sm font-medium text-slate-300" }, "Outer Shell Crop"),
+                        React.createElement('span', { className: "text-slate-400 font-mono" }, Math.round(state.radialClip * 100) + "%")
+                    ),
+                    React.createElement('input', {
+                        type: "range", min: "0", max: "1", step: "0.01", value: state.radialClip,
+                        onChange: (e) => onChange({ radialClip: parseFloat(e.target.value) }),
+                        className: "w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-teal-500 hover:accent-teal-400 transition-all"
+                    })
+                    )
+                ),
+
+                /* Common Controls */
+                React.createElement('div', { className: "grid grid-cols-2 gap-4" },
+                    state.viewMode === 'ORBITAL' ? React.createElement('div', null,
+                        React.createElement('label', { className: "text-xs font-medium text-slate-400 mb-1 block" }, "Node Clarity"),
+                        React.createElement('input', {
+                        type: "range", min: "1.0", max: "4.0", step: "0.1", value: state.probPower,
+                        onChange: (e) => onChange({ probPower: parseFloat(e.target.value) }),
+                        className: "w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-pink-500"
+                        }),
+                        React.createElement('p', { className: "text-[10px] text-slate-500 mt-1" }, "Enhance empty regions")
+                    ) : React.createElement('div', null,
+                        React.createElement('label', { className: "text-xs font-medium text-slate-400 mb-1 block" }, "Speed"),
+                        React.createElement('input', {
+                        type: "range", min: "0.1", max: "3", step: "0.1", value: state.speed,
+                        onChange: (e) => onChange({ speed: parseFloat(e.target.value) }),
+                        className: "w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-slate-400"
+                        })
+                    ),
+                    React.createElement('div', null,
+                    React.createElement('label', { className: "text-xs font-medium text-slate-400 mb-1 block" },
+                        state.viewMode === 'DRUM' ? 'Amp' : state.viewMode === 'STRING' ? 'Amp' : 'Density'
+                    ),
+                    React.createElement('input', {
+                        type: "range", min: "0.1", max: "2.5", step: "0.1", value: state.amplitude,
+                        onChange: (e) => onChange({ amplitude: parseFloat(e.target.value) }),
+                        className: "w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
+                    })
+                    )
+                ),
+
+                /* Zoom & Brightness */
+                React.createElement('div', { className: "grid grid-cols-2 gap-4" },
+                    React.createElement('div', null,
+                    React.createElement('label', { className: "text-xs font-medium text-slate-400 mb-1 block" }, "Zoom"),
+                    React.createElement('input', {
+                        type: "range", min: "0.2", max: "3", step: "0.1", value: state.zoom,
+                        onChange: (e) => onChange({ zoom: parseFloat(e.target.value) }),
+                        className: "w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                    })
+                    ),
+                    state.viewMode === 'ORBITAL' && React.createElement('div', null,
+                    React.createElement('label', { className: "text-xs font-medium text-slate-400 mb-1 block" }, "Brightness"),
+                    React.createElement('input', {
+                        type: "range", min: "0.5", max: "5.0", step: "0.1", value: state.particleBrightness,
+                        onChange: (e) => onChange({ particleBrightness: parseFloat(e.target.value) }),
+                        className: "w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-yellow-400"
+                    })
+                    )
+                ),
+
+                /* Play/Pause */
+                React.createElement('div', { className: "pt-2" },
+                    React.createElement('button', {
+                    onClick: () => onChange({ isPlaying: !state.isPlaying }),
+                    className: `w-full py-3 rounded-lg font-bold transition-all duration-200 flex items-center justify-center gap-2 ${state.isPlaying ? 'bg-slate-700 text-slate-200 hover:bg-slate-600' : 'bg-sky-600 text-white hover:bg-sky-500 shadow-lg shadow-sky-500/20'}`
+                    },
+                    state.isPlaying ? React.createElement('span', { className: "flex items-center gap-2" },
+                        React.createElement('svg', { xmlns: "http://www.w3.org/2000/svg", className: "h-5 w-5", viewBox: "0 0 20 20", fill: "currentColor" },
+                            React.createElement('path', { fillRule: "evenodd", d: "M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z", clipRule: "evenodd" })
+                        ),
+                        "Pause"
+                    ) : React.createElement('span', { className: "flex items-center gap-2" },
+                        React.createElement('svg', { xmlns: "http://www.w3.org/2000/svg", className: "h-5 w-5", viewBox: "0 0 20 20", fill: "currentColor" },
+                            React.createElement('path', { fillRule: "evenodd", d: "M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z", clipRule: "evenodd" })
+                        ),
+                        "Resume"
+                    )
+                    )
+                )
+                )
+            );
+        };
+
+        // --- App Component ---
+        const App = () => {
+            const [state, setState] = useState({
+                l: 1, 
+                n: 1, 
+                isPlaying: true,
+                speed: 0.8,
+                amplitude: 1,
+                showNodalLines: true,
+                resolution: 100,
+                viewMode: 'DRUM', 
+                zoom: 1.0,
+                slicePosition: 0, 
+                radialClip: 1.0, 
+                particleBrightness: 1.5, 
+                probPower: 1.5 
+            });
+
+            const handleStateChange = (newState) => {
+                setState(prev => ({ ...prev, ...newState }));
+            };
+
+            return React.createElement('div', { className: "min-h-screen bg-slate-900 text-slate-200 selection:bg-sky-500/30" },
+                /* Header */
+                React.createElement('header', { className: "bg-slate-900/80 backdrop-blur-lg border-b border-slate-800 sticky top-0 z-50" },
+                React.createElement('div', { className: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between" },
+                    React.createElement('div', { className: "flex items-center gap-3" },
+                    React.createElement('div', { className: "w-8 h-8 rounded-full bg-gradient-to-tr from-sky-500 to-purple-600 flex items-center justify-center shadow-lg shadow-purple-500/20" },
+                        React.createElement('span', { className: "font-bold text-white text-lg" }, "Q")
+                    ),
+                    React.createElement('h1', { className: "text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-sky-400 to-purple-400" }, "Quantum Drum")
+                    ),
+                    React.createElement('a', { href: "#", className: "text-sm font-medium text-slate-400 hover:text-white transition-colors" }, "Resonant Modes Visualization")
+                )
+                ),
+
+                /* Main */
+                React.createElement('main', { className: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:py-12" },
+                React.createElement('div', { className: "grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-12 items-start" },
+                    /* Left Column */
+                    React.createElement('div', { className: "lg:col-span-7 flex flex-col items-center" },
+                    React.createElement('div', { className: "relative w-full aspect-square max-w-[600px] mx-auto" },
+                        React.createElement(DrumCanvas, {
+                            l: state.l,
+                            n: state.n,
+                            isPlaying: state.isPlaying,
+                            speed: state.speed,
+                            amplitude: state.amplitude,
+                            resolution: state.resolution,
+                            viewMode: state.viewMode,
+                            zoom: state.zoom,
+                            slicePosition: state.slicePosition,
+                            radialClip: state.radialClip,
+                            particleBrightness: state.particleBrightness,
+                            probPower: state.probPower
+                        }),
+                        /* Legend */
+                        React.createElement('div', { className: "absolute -bottom-12 left-0 right-0 flex justify-center gap-8 text-xs font-mono text-slate-400" },
+                        React.createElement('div', { className: "flex items-center gap-2" },
+                            React.createElement('div', { className: "w-3 h-3 rounded-full bg-sky-400 shadow-[0_0_10px_rgba(56,189,248,0.5)]" }),
+                            React.createElement('span', null, "Positive Phase (+)")
+                        ),
+                        state.viewMode === 'DRUM' && React.createElement('div', { className: "flex items-center gap-2" },
+                            React.createElement('div', { className: "w-3 h-3 rounded-full bg-slate-700 border border-slate-600" }),
+                            React.createElement('span', null, "Node (0)")
+                        ),
+                        React.createElement('div', { className: "flex items-center gap-2" },
+                            React.createElement('div', { className: "w-3 h-3 rounded-full bg-rose-400 shadow-[0_0_10px_rgba(251,113,133,0.5)]" }),
+                            React.createElement('span', null, "Negative Phase (-)")
+                        )
+                        )
+                    )
+                    ),
+                    /* Right Column */
+                    React.createElement('div', { className: "lg:col-span-5 space-y-6" },
+                    React.createElement(Controls, { state: state, onChange: handleStateChange }),
+                    React.createElement(InfoPanel, { l: state.l, n: state.n })
+                    )
+                )
+                ),
+
+                /* Footer */
+                React.createElement('footer', { className: "mt-12 py-8 border-t border-slate-800 text-center text-slate-500 text-sm" },
+                React.createElement('p', null, "Switch between Classical Membrane mechanics and Quantum Orbital mechanics.")
+                )
+            );
+        };
+
+        // --- Init ---
+        const rootElement = document.getElementById('root');
+        if (rootElement) {
+            const root = ReactDOM.createRoot(rootElement);
+            root.render(
+                React.createElement(React.StrictMode, null,
+                React.createElement(App)
+                )
+            );
+        }
+    </script>
+</body>
 </html>
